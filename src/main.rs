@@ -2,6 +2,8 @@ use bevy::{
     prelude::*,
     render::{mesh::Indices, render_resource::PrimitiveTopology},
     tasks::{AsyncComputeTaskPool, Task},
+    window::CursorGrabMode,
+    input::mouse::MouseMotion,
 };
 use noise::{NoiseFn, Perlin};
 use std::{
@@ -14,6 +16,7 @@ use futures_lite;
 const CHUNK_SIZE: i32 = 16;
 const RENDER_DISTANCE: i32 = 6;
 const VOXEL_SIZE: f32 = 1.0;
+const MOUSE_SENSITIVITY: f32 = 0.5;
 
 // Main function to set up and run the Bevy app
 fn main() {
@@ -26,9 +29,12 @@ fn main() {
             Update,
             (
                 player_movement,
+                mouse_look,
+                cursor_grab,
                 chunk_loading,
                 process_chunk_mesh_tasks,
                 update_chunks,
+                update_skybox,
             ),
         )
         .run();
@@ -37,19 +43,19 @@ fn main() {
 // Resources
 #[derive(Resource)]
 struct VoxelAssets {
-    material: Handle<StandardMaterial>,
+    materials: HashMap<VoxelType, Handle<StandardMaterial>>,
 }
 
 impl Default for VoxelAssets {
     fn default() -> Self {
         Self {
-            material: Handle::default(),
+            materials: HashMap::new(),
         }
     }
 }
 
 // Voxel and Chunk related data structures
-#[derive(Clone, Debug, Eq, PartialEq, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq, Copy, Hash)]
 enum VoxelType {
     Air,
     Dirt,
@@ -111,7 +117,7 @@ impl VoxelChunk {
 struct VoxelWorld {
     chunks: HashMap<ChunkCoord, Arc<Mutex<VoxelChunk>>>,
     loaded_chunks: HashSet<ChunkCoord>,
-    chunk_mesh_tasks: Vec<(ChunkCoord, Task<(Mesh, ChunkCoord)>)>,
+    chunk_mesh_tasks: Vec<(ChunkCoord, Task<(Mesh, ChunkCoord, VoxelType)>)>,
     terrain_generator: Perlin,
 }
 
@@ -130,45 +136,67 @@ impl Default for VoxelWorld {
 #[derive(Component)]
 struct Player {
     chunk_coord: ChunkCoord,
+    yaw: f32,
+    pitch: f32,
 }
 
-// Setup function to initialize the world
-fn setup(
-    mut commands: Commands,
-    _meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut voxel_assets: ResMut<VoxelAssets>,
+// Component to mark the skybox
+#[derive(Component)]
+struct Skybox;
+
+// System to handle mouse input for camera rotation
+fn mouse_look(
+    windows: Query<&Window>,
+    mut player_query: Query<(&mut Transform, &mut Player)>,
+    mut mouse_motion: EventReader<MouseMotion>,
 ) {
-    // Create a simple material for voxels
-    voxel_assets.material = materials.add(StandardMaterial {
-        base_color: Color::rgb(0.8, 0.8, 0.8),
-        ..default()
-    });
+    let window = windows.single();
+    
+    // Only rotate camera if cursor is grabbed
+    if window.cursor.grab_mode == CursorGrabMode::Locked {
+        let mut mouse_delta = Vec2::ZERO;
+        for event in mouse_motion.read() {
+            mouse_delta += event.delta;
+        }
+        
+        if mouse_delta == Vec2::ZERO {
+            return;
+        }
+        
+        // Apply to each player (typically only one)
+        for (mut transform, mut player) in player_query.iter_mut() {
+            // Update the player rotation based on mouse movement
+            player.yaw -= (mouse_delta.x * MOUSE_SENSITIVITY * 0.1).to_radians();
+            player.pitch -= (mouse_delta.y * MOUSE_SENSITIVITY * 0.1).to_radians();
+            
+            // Clamp the pitch to prevent the camera from flipping
+            player.pitch = player.pitch.clamp(-1.54, 1.54);
+            
+            // Apply the rotation to the transform
+            transform.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0);
+        }
+    }
+}
 
-    // Add a camera
-    commands.spawn(Camera3dBundle {
-        transform: Transform::from_xyz(0.0, 30.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
-        ..default()
-    });
-
-    // Add a light
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
-            illuminance: 10000.0,
-            shadows_enabled: true,
-            ..default()
-        },
-        transform: Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_4)),
-        ..default()
-    });
-
-    // Add a player
-    commands.spawn((
-        Player {
-            chunk_coord: ChunkCoord::new(0, 0, 0),
-        },
-        TransformBundle::from_transform(Transform::from_xyz(0.0, 20.0, 0.0)),
-    ));
+// System to handle cursor grabbing
+fn cursor_grab(
+    mut windows: Query<&mut Window>,
+    keyboard_input: Res<Input<KeyCode>>,
+    mouse_button_input: Res<Input<MouseButton>>,
+) {
+    let mut window = windows.single_mut();
+    
+    if keyboard_input.just_pressed(KeyCode::Escape) {
+        // Escape will free the cursor
+        window.cursor.grab_mode = CursorGrabMode::None;
+        window.cursor.visible = true;
+    }
+    
+    if mouse_button_input.just_pressed(MouseButton::Left) {
+        // Clicking will grab the cursor
+        window.cursor.grab_mode = CursorGrabMode::Locked;
+        window.cursor.visible = false;
+    }
 }
 
 // System to handle player movement
@@ -176,23 +204,39 @@ fn player_movement(
     keyboard_input: Res<Input<KeyCode>>,
     time: Res<Time>,
     mut player_query: Query<(&mut Transform, &mut Player)>,
+    windows: Query<&Window>,
 ) {
+    let window = windows.single();
+    // Only move if cursor is grabbed
+    if window.cursor.grab_mode != CursorGrabMode::Locked {
+        return;
+    }
+    
     let speed = 10.0;
     for (mut transform, mut player) in player_query.iter_mut() {
         let mut direction = Vec3::ZERO;
 
+        // Get local direction vectors based on player rotation
+        let forward = transform.forward();
+        let right = transform.right();
+        
+        // Forward/backward movement
         if keyboard_input.pressed(KeyCode::W) {
-            direction.z -= 1.0;
+            direction += forward;
         }
         if keyboard_input.pressed(KeyCode::S) {
-            direction.z += 1.0;
+            direction -= forward;
         }
+        
+        // Left/right movement
         if keyboard_input.pressed(KeyCode::A) {
-            direction.x -= 1.0;
+            direction -= right;
         }
         if keyboard_input.pressed(KeyCode::D) {
-            direction.x += 1.0;
+            direction += right;
         }
+        
+        // Up/down movement (world Y axis)
         if keyboard_input.pressed(KeyCode::Space) {
             direction.y += 1.0;
         }
@@ -289,7 +333,10 @@ fn chunk_loading(
             if let Some(chunk_arc) = voxel_world.chunks.get(&chunk_coord) {
                 if let Ok(chunk) = chunk_arc.lock() {
                     if let Some(entity) = chunk.entity {
-                        commands.entity(entity).despawn_recursive();
+                        // Make sure the entity exists before trying to despawn it
+                        if commands.get_entity(entity).is_some() {
+                            commands.entity(entity).despawn_recursive();
+                        }
                     }
                 }
             }
@@ -302,6 +349,35 @@ fn generate_terrain(chunk: &mut VoxelChunk, noise_fn: &Perlin) {
     let world_scale = 0.02;
     let height_scale = 32.0;
 
+    // Create a clear area around spawn point (for debugging)
+    let spawn_chunk_range = 1; // Clear 1 chunk in each direction from spawn
+    let is_spawn_area = 
+        chunk.coord.x >= -spawn_chunk_range && chunk.coord.x <= spawn_chunk_range &&
+        chunk.coord.z >= -spawn_chunk_range && chunk.coord.z <= spawn_chunk_range &&
+        chunk.coord.y >= -spawn_chunk_range && chunk.coord.y <= spawn_chunk_range;
+    
+    if is_spawn_area {
+        // Fill the spawn area with air for testing
+        for x in 0..CHUNK_SIZE as usize {
+            for y in 0..CHUNK_SIZE as usize {
+                for z in 0..CHUNK_SIZE as usize {
+                    chunk.set_voxel(x, y, z, VoxelType::Air);
+                }
+            }
+        }
+        
+        // Add a platform at y=0 if this is the bottom chunk
+        if chunk.coord.y == -1 {
+            for x in 0..CHUNK_SIZE as usize {
+                for z in 0..CHUNK_SIZE as usize {
+                    // Create a flat platform at the top of this chunk
+                    chunk.set_voxel(x, (CHUNK_SIZE-1) as usize, z, VoxelType::Stone);
+                }
+            }
+        }
+        return;
+    }
+
     for x in 0..CHUNK_SIZE {
         for z in 0..CHUNK_SIZE {
             // Calculate the world position for the noise function
@@ -310,21 +386,22 @@ fn generate_terrain(chunk: &mut VoxelChunk, noise_fn: &Perlin) {
             
             // Generate a height value using Perlin noise
             let noise_val = noise_fn.get([world_x, world_z]);
-            let height = ((noise_val + 1.0) * 0.5 * height_scale) as i32;
+            let terrain_height = ((noise_val + 1.0) * 0.5 * height_scale) as i32;
             
-            // World Y position of the top of this column
-            let world_height = height + chunk.coord.y * CHUNK_SIZE;
+            // Calculate absolute height in world space (independent of chunk y-coordinate)
+            let absolute_terrain_height = terrain_height;
             
             for y in 0..CHUNK_SIZE {
-                let local_y = chunk.coord.y * CHUNK_SIZE + y;
+                // Calculate the absolute y position in world coordinates
+                let absolute_y = chunk.coord.y * CHUNK_SIZE + y;
                 
-                if local_y < world_height - 3 {
+                if absolute_y < absolute_terrain_height - 3 {
                     // Stone below the surface
                     chunk.set_voxel(x as usize, y as usize, z as usize, VoxelType::Stone);
-                } else if local_y < world_height - 1 {
+                } else if absolute_y < absolute_terrain_height - 1 {
                     // Dirt layer
                     chunk.set_voxel(x as usize, y as usize, z as usize, VoxelType::Dirt);
-                } else if local_y < world_height {
+                } else if absolute_y < absolute_terrain_height {
                     // Grass on top
                     chunk.set_voxel(x as usize, y as usize, z as usize, VoxelType::Grass);
                 } else {
@@ -337,7 +414,7 @@ fn generate_terrain(chunk: &mut VoxelChunk, noise_fn: &Perlin) {
 }
 
 // Function to generate the mesh for a chunk
-fn generate_chunk_mesh(chunk_arc: &Arc<Mutex<VoxelChunk>>, chunk_coord: ChunkCoord) -> (Mesh, ChunkCoord) {
+fn generate_chunk_mesh(chunk_arc: &Arc<Mutex<VoxelChunk>>, chunk_coord: ChunkCoord) -> (Mesh, ChunkCoord, VoxelType) {
     let chunk = chunk_arc.lock().unwrap();
     
     // Vertices, normals, uvs, and indices for the mesh
@@ -345,6 +422,10 @@ fn generate_chunk_mesh(chunk_arc: &Arc<Mutex<VoxelChunk>>, chunk_coord: ChunkCoo
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
+    
+    // Keep track of voxel types in this chunk for material selection
+    let mut chunk_voxel_types = HashSet::new();
+    let mut primary_voxel_type = VoxelType::Stone; // Default fallback
     
     // Directions for checking adjacent blocks (right, left, up, down, forward, back)
     let directions = [
@@ -396,6 +477,10 @@ fn generate_chunk_mesh(chunk_arc: &Arc<Mutex<VoxelChunk>>, chunk_coord: ChunkCoo
                     continue;
                 }
                 
+                // Track voxel types in this chunk
+                chunk_voxel_types.insert(*voxel_type);
+                primary_voxel_type = *voxel_type; // Use the last non-air voxel type as fallback
+                
                 // Check each of the six faces
                 for (face_idx, (dx, dy, dz)) in directions.iter().enumerate() {
                     let nx = x as i32 + dx;
@@ -442,6 +527,16 @@ fn generate_chunk_mesh(chunk_arc: &Arc<Mutex<VoxelChunk>>, chunk_coord: ChunkCoo
         }
     }
     
+    // Choose the most representative voxel type for the chunk
+    // This is a simple approach - a better one would be to split the mesh by voxel type
+    if chunk_voxel_types.contains(&VoxelType::Grass) {
+        primary_voxel_type = VoxelType::Grass;
+    } else if chunk_voxel_types.contains(&VoxelType::Dirt) {
+        primary_voxel_type = VoxelType::Dirt;
+    } else if chunk_voxel_types.contains(&VoxelType::Stone) {
+        primary_voxel_type = VoxelType::Stone;
+    }
+    
     // Create the mesh
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList);
     
@@ -450,7 +545,7 @@ fn generate_chunk_mesh(chunk_arc: &Arc<Mutex<VoxelChunk>>, chunk_coord: ChunkCoo
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.set_indices(Some(Indices::U32(indices)));
     
-    (mesh, chunk_coord)
+    (mesh, chunk_coord, primary_voxel_type)
 }
 
 // System to process chunk mesh generation tasks
@@ -460,22 +555,32 @@ fn process_chunk_mesh_tasks(
     voxel_assets: Res<VoxelAssets>,
     mut voxel_world: ResMut<VoxelWorld>,
 ) {
-    let mut completed_tasks: Vec<(usize, (Mesh, ChunkCoord))> = Vec::new();
+    // Process completed mesh tasks
+    let mut completed_tasks = Vec::new();
     
-    // Check which tasks are completed
-    for (i, (_coord, task)) in voxel_world.chunk_mesh_tasks.iter_mut().enumerate() {
-        if let Some(result) = futures_lite::future::block_on(futures_lite::future::poll_once(task)) {
-            completed_tasks.push((i, result));
+    for (i, (chunk_coord, task)) in voxel_world.chunk_mesh_tasks.iter_mut().enumerate() {
+        if let Some(mesh_result) = futures_lite::future::block_on(futures_lite::future::poll_once(task)) {
+            completed_tasks.push((i, mesh_result));
         }
     }
     
-    // Process completed tasks in reverse order to avoid index invalidation
-    for (index, (mesh, chunk_coord)) in completed_tasks.iter().rev() {
+    // Process completed tasks in reverse order to avoid index issues when removing
+    for (index, (mesh, chunk_coord, voxel_type)) in completed_tasks.iter().rev() {
         // Remove the task from the list
         let _removed_task = voxel_world.chunk_mesh_tasks.remove(*index);
         
+        // Only process if the chunk is still loaded
+        if !voxel_world.loaded_chunks.contains(chunk_coord) {
+            continue; // Skip this chunk as it's no longer loaded
+        }
+        
+        // Get the material for this voxel type, or use stone as fallback
+        let material = voxel_assets.materials.get(voxel_type)
+            .unwrap_or_else(|| voxel_assets.materials.get(&VoxelType::Stone).unwrap())
+            .clone();
+        
         // Add the mesh as an entity
-        if let Some(chunk_arc) = voxel_world.chunks.get(&chunk_coord) {
+        if let Some(chunk_arc) = voxel_world.chunks.get(chunk_coord) {
             if let Ok(mut chunk) = chunk_arc.lock() {
                 // Calculate the world position for this chunk
                 let chunk_pos = Vec3::new(
@@ -486,13 +591,30 @@ fn process_chunk_mesh_tasks(
                 
                 // If the chunk already has an entity, update its mesh
                 if let Some(entity) = chunk.entity {
-                    commands.entity(entity).insert(meshes.add(mesh.clone()));
+                    // Check if the entity still exists before using it
+                    if commands.get_entity(entity).is_some() {
+                        commands.entity(entity)
+                            .insert(meshes.add(mesh.clone()))
+                            .insert(material);
+                    } else {
+                        // Entity doesn't exist anymore, create a new one
+                        let entity = commands
+                            .spawn(PbrBundle {
+                                mesh: meshes.add(mesh.clone()),
+                                material: material,
+                                transform: Transform::from_translation(chunk_pos),
+                                ..default()
+                            })
+                            .id();
+                        
+                        chunk.entity = Some(entity);
+                    }
                 } else {
                     // Otherwise create a new entity
                     let entity = commands
                         .spawn(PbrBundle {
                             mesh: meshes.add(mesh.clone()),
-                            material: voxel_assets.material.clone(),
+                            material: material,
                             transform: Transform::from_translation(chunk_pos),
                             ..default()
                         })
@@ -545,4 +667,132 @@ fn update_chunks(
         
         voxel_world.chunk_mesh_tasks.push((coord, task));
     }
+}
+
+// System to update the skybox to follow the player
+fn update_skybox(
+    player_query: Query<&Transform, With<Player>>,
+    mut skybox_query: Query<&mut Transform, (With<Skybox>, Without<Player>)>,
+) {
+    if let Ok(player_transform) = player_query.get_single() {
+        if let Ok(mut skybox_transform) = skybox_query.get_single_mut() {
+            // Update skybox position to match player position
+            skybox_transform.translation = player_transform.translation;
+        }
+    }
+}
+
+// Setup function to initialize the world
+fn setup(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut voxel_assets: ResMut<VoxelAssets>,
+) {
+    // Create materials for each voxel type
+    voxel_assets.materials.insert(VoxelType::Dirt, materials.add(StandardMaterial {
+        base_color: Color::rgb(0.55, 0.27, 0.07), // Brown
+        ..default()
+    }));
+    
+    voxel_assets.materials.insert(VoxelType::Grass, materials.add(StandardMaterial {
+        base_color: Color::rgb(0.0, 0.8, 0.0), // Green
+        ..default()
+    }));
+    
+    voxel_assets.materials.insert(VoxelType::Stone, materials.add(StandardMaterial {
+        base_color: Color::rgb(0.5, 0.5, 0.5), // Gray
+        ..default()
+    }));
+
+    // Add a light
+    commands.spawn(DirectionalLightBundle {
+        directional_light: DirectionalLight {
+            illuminance: 10000.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        transform: Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_4)),
+        ..default()
+    });
+
+    // Add a skybox
+    let skybox_size = 1000.0; // Large enough to contain the visible world
+    let skybox_material = materials.add(StandardMaterial {
+        base_color: Color::rgb(0.5, 0.7, 1.0), // Sky blue color
+        emissive: Color::rgb(0.1, 0.1, 0.2),   // Make it slightly self-illuminating
+        unlit: true,                           // Unaffected by lighting
+        cull_mode: None,                       // Render the inside faces
+        ..default()
+    });
+    
+    // Spawn the skybox at the player's spawn position
+    let player_spawn_position = Vec3::new(0.0, 50.0, 0.0);
+    
+    commands.spawn((
+        PbrBundle {
+            mesh: meshes.add(Mesh::from(shape::Box::new(skybox_size, skybox_size, skybox_size))),
+            material: skybox_material,
+            transform: Transform::from_translation(player_spawn_position),
+            // The skybox should be rendered behind everything else
+            visibility: Visibility::Visible,
+            ..default()
+        },
+        Skybox,
+    ));
+
+    // Add a debug cube at origin to help debug rendering
+    commands.spawn(PbrBundle {
+        mesh: meshes.add(Mesh::from(shape::Cube { size: 1.0 })),
+        material: materials.add(StandardMaterial {
+            base_color: Color::RED,
+            ..default()
+        }),
+        transform: Transform::from_xyz(0.0, 0.0, 0.0),
+        ..default()
+    });
+
+    // Add a debug cube at player spawn position
+    commands.spawn(PbrBundle {
+        mesh: meshes.add(Mesh::from(shape::Cube { size: 1.0 })),
+        material: materials.add(StandardMaterial {
+            base_color: Color::GREEN,
+            ..default()
+        }),
+        transform: Transform::from_xyz(0.0, 50.0, 0.0),
+        ..default()
+    });
+
+    // Add a player with camera as child
+    commands.spawn((
+        Player {
+            chunk_coord: ChunkCoord::new(0, 0, 0),
+            yaw: 0.0,
+            pitch: 0.0,
+        },
+        TransformBundle::from_transform(Transform::from_xyz(0.0, 50.0, 0.0)),
+    ))
+    .with_children(|parent| {
+        // Add camera as child of player
+        parent.spawn((
+            Camera3dBundle {
+                transform: Transform::from_xyz(0.0, 2.0, 0.0),
+                camera: Camera {
+                    // Enable HDR for better lighting effects
+                    hdr: true,
+                    ..default()
+                },
+                ..default()
+            },
+            // Add fog as a separate component
+            FogSettings {
+                color: Color::rgba(0.5, 0.7, 1.0, 1.0), // Match skybox color
+                falloff: FogFalloff::Linear {
+                    start: 50.0, // Start fog at this distance
+                    end: 300.0,  // Full fog at this distance
+                },
+                ..default()
+            },
+        ));
+    });
 }
